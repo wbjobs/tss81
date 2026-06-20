@@ -19,7 +19,7 @@ export function useWebRTC() {
   let currentPeerId = null;
   let isInitiator = false;
   let iceCandidateQueue = [];
-  let signalListenerAttached = false;
+  let signalHandler = null;
 
   function createPeerConnection() {
     if (peerConnection) {
@@ -37,14 +37,6 @@ export function useWebRTC() {
           candidate: event.candidate
         });
       }
-    };
-
-    peerConnection.onicegatheringstatechange = () => {
-      console.log('[WebRTC] ICE gathering state:', peerConnection.iceGatheringState);
-    };
-
-    peerConnection.onsignalingstatechange = () => {
-      console.log('[WebRTC] Signaling state:', peerConnection.signalingState);
     };
 
     peerConnection.ondatachannel = (event) => {
@@ -173,14 +165,15 @@ export function useWebRTC() {
   function setPeerId(peerId, initiator) {
     currentPeerId = peerId;
     isInitiator = initiator;
+    iceCandidateQueue = [];
 
-    if (!signalListenerAttached) {
-      signalListenerAttached = true;
-      socket.on('signal', ({ from, data }) => {
+    if (!signalHandler) {
+      signalHandler = ({ from, data }) => {
         if (from === currentPeerId) {
           handleSignal(data);
         }
-      });
+      };
+      socket.on('signal', signalHandler);
     }
 
     if (initiator) {
@@ -190,8 +183,13 @@ export function useWebRTC() {
 
   function sendMessage(message) {
     if (dataChannel && dataChannel.readyState === 'open') {
-      dataChannel.send(JSON.stringify(message));
-      return true;
+      try {
+        dataChannel.send(JSON.stringify(message));
+        return true;
+      } catch (e) {
+        console.error('[WebRTC] Failed to send message:', e);
+        return false;
+      }
     }
     return false;
   }
@@ -217,23 +215,29 @@ export function useWebRTC() {
   }
 
   function cleanup() {
+    if (signalHandler) {
+      socket.off('signal', signalHandler);
+      signalHandler = null;
+    }
+
     if (dataChannel) {
       try {
         dataChannel.close();
       } catch (e) {}
       dataChannel = null;
     }
+
     if (peerConnection) {
       try {
         peerConnection.close();
       } catch (e) {}
       peerConnection = null;
     }
+
     isConnected.value = false;
     currentPeerId = null;
     isInitiator = false;
     iceCandidateQueue = [];
-    signalListenerAttached = false;
     onMessageCallbacks.length = 0;
     onConnectionChangeCallbacks.length = 0;
   }

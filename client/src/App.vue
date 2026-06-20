@@ -106,9 +106,9 @@
               <div class="message-meta">
                 <span>{{ formatTime(msg.timestamp) }}</span>
                 <span v-if="msg.sent && !msg.destroyed && !msg.viewed">已送达 · 待查看</span>
-                <span v-else-if="msg.sent && msg.viewed && !msg.destroyed">已查看</span>
+                <span v-else-if="msg.sent && msg.viewed && !msg.destroyed">已查看 · {{ getCountdown(msg) }}s 后销毁</span>
                 <span v-else-if="!msg.destroyed" class="burn-countdown">
-                  {{ msg.countdown }}s 后销毁
+                  {{ getCountdown(msg) }}s 后销毁
                 </span>
               </div>
             </div>
@@ -151,6 +151,8 @@ import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue';
 import { useSocket, createRoom, joinRoom, notifyMessageDestroyed } from './composables/useSocket';
 import { useWebRTC } from './composables/useWebRTC';
 
+const BURN_DELAY = 5000;
+
 const socket = useSocket();
 const { isConnected: webrtcConnected, setPeerId, sendMessage, onMessage, onConnectionChange, cleanup: cleanupWebRTC } = useWebRTC();
 
@@ -169,7 +171,8 @@ const messagesContainer = ref(null);
 
 let removeMessageListener = null;
 let removeConnectionListener = null;
-const countdownTimers = new Map();
+const destroyTimers = new Map();
+let globalCheckTimer = null;
 
 function generateMessageId() {
   return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
@@ -180,12 +183,283 @@ function formatTime(timestamp) {
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function getCountdown(msg) {
+  if (!msg.viewed || msg.destroyed) return 0;
+  const remaining = Math.max(0, Math.ceil((msg.destroyAt - Date.now()) / 1000));
+  return remaining;
+}
+
 function scrollToBottom() {
   nextTick(() => {
     if (messagesContainer.value) {
       messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
     }
   });
+}
+
+function startGlobalCheck() {
+  if (globalCheckTimer) return;
+  globalCheckTimer = setInterval(() => {
+    const now = Date.now();
+    for (const msg of messages.value) {
+      if (msg.viewed && !msg.destroyed && msg.destroyAt && now >= msg.destroyAt) {
+        destroyMessage(msg, !msg.sent);
+      }
+    }
+  }, 1000);
+}
+
+function stopGlobalCheck() {
+  if (globalCheckTimer) {
+    clearInterval(globalCheckTimer);
+    globalCheckTimer = null;
+  }
+}
+
+function setupVisibilityListener() {
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+}
+
+function removeVisibilityListener() {
+  document.removeEventListener('visibilitychange', handleVisibilityChange);
+}
+
+function handleVisibilityChange() {
+  if (!document.hidden) {
+    const now = Date.now();
+    for (const msg of messages.value) {
+      if (msg.viewed && !msg.destroyed && msg.destroyAt) {
+        if (now >= msg.destroyAt) {
+          destroyMessage(msg, !msg.sent);
+        } else {
+          scheduleDestroy(msg);
+        }
+      }
+    }
+  }
+}
+
+function scheduleDestroy(msg) {
+  if (destroyTimers.has(msg.id)) {
+    clearTimeout(destroyTimers.get(msg.id));
+  }
+
+  const delay = Math.max(0, msg.destroyAt - Date.now());
+
+  const timer = setTimeout(() => {
+    destroyTimers.delete(msg.id);
+    destroyMessage(msg, !msg.sent);
+  }, delay);
+
+  destroyTimers.set(msg.id, timer);
+}
+
+function markMessageViewed(msg, viewedAt) {
+  if (msg.viewed) return;
+
+  msg.viewed = true;
+  msg.viewedAt = viewedAt || Date.now();
+  msg.destroyAt = msg.viewedAt + BURN_DELAY;
+
+  scheduleDestroy(msg);
+}
+
+function destroyMessage(msg, notifyPeer) {
+  if (msg.destroyed) return;
+
+  if (destroyTimers.has(msg.id)) {
+    clearTimeout(destroyTimers.get(msg.id));
+    destroyTimers.delete(msg.id);
+  }
+
+  msg.destroying = true;
+
+  setTimeout(() => {
+    msg.destroyed = true;
+    msg.text = '';
+    msg.destroyedAt = Date.now();
+  }, 500);
+
+  if (notifyPeer) {
+    if (msg.sent) {
+      sendMessage({
+        type: 'destroyed',
+        messageId: msg.id
+      });
+    } else {
+      notifyMessageDestroyed(msg.id);
+    }
+  }
+}
+
+function syncMessageStatus(messageId, status, extra = {}) {
+  let msg = messages.value.find((m) => m.id === messageId);
+
+  if (!msg && extra.text && extra.timestamp) {
+    msg = {
+      id: messageId,
+      text: extra.text,
+      sent: false,
+      timestamp: extra.timestamp,
+      viewed: false,
+      destroying: false,
+      destroyed: false
+    };
+    messages.value.push(msg);
+    scrollToBottom();
+  }
+
+  if (!msg) return;
+
+  if (status === 'viewed' && !msg.viewed) {
+    markMessageViewed(msg, extra.viewedAt);
+  } else if (status === 'destroyed' && !msg.destroyed) {
+    destroyMessage(msg, false);
+  }
+}
+
+function handleIncomingMessage(data) {
+  if (data.type === 'text') {
+    const existing = messages.value.find((m) => m.id === data.id);
+    if (existing) {
+      if (!existing.viewed && data.status === 'viewed') {
+        markMessageViewed(existing, data.viewedAt);
+      }
+      if (data.status === 'destroyed') {
+        destroyMessage(existing, false);
+      }
+      return;
+    }
+
+    const msg = {
+      id: data.id,
+      text: data.text,
+      sent: false,
+      timestamp: data.timestamp,
+      viewed: false,
+      destroying: false,
+      destroyed: false
+    };
+
+    if (data.status === 'viewed') {
+      markMessageViewed(msg, data.viewedAt);
+    }
+    if (data.status === 'destroyed') {
+      msg.destroyed = true;
+      msg.text = '';
+    }
+
+    messages.value.push(msg);
+    scrollToBottom();
+
+  } else if (data.type === 'viewed') {
+    const msg = messages.value.find((m) => m.id === data.messageId);
+    if (msg) {
+      markMessageViewed(msg, data.viewedAt);
+    }
+
+  } else if (data.type === 'destroyed') {
+    const msg = messages.value.find((m) => m.id === data.messageId);
+    if (msg) {
+      destroyMessage(msg, false);
+    }
+
+  } else if (data.type === 'sync-request') {
+    syncMessagesToPeer();
+
+  } else if (data.type === 'sync-batch') {
+    for (const item of data.messages) {
+      syncMessageStatus(item.id, item.status, {
+        text: item.text,
+        timestamp: item.timestamp,
+        viewedAt: item.viewedAt
+      });
+    }
+  }
+}
+
+function syncMessagesToPeer() {
+  const syncData = messages.value
+    .filter((m) => m.sent && !m.destroyed)
+    .map((m) => ({
+      id: m.id,
+      text: m.text,
+      timestamp: m.timestamp,
+      status: m.viewed ? 'viewed' : 'pending',
+      viewedAt: m.viewedAt || null
+    }));
+
+  if (syncData.length > 0) {
+    sendMessage({
+      type: 'sync-batch',
+      messages: syncData
+    });
+  }
+}
+
+function viewMessage(msg) {
+  if (msg.viewed) return;
+
+  const viewedAt = Date.now();
+  markMessageViewed(msg, viewedAt);
+
+  sendMessage({
+    type: 'viewed',
+    messageId: msg.id,
+    viewedAt: viewedAt
+  });
+}
+
+function handleSend() {
+  if (!inputText.value.trim() || !webrtcConnected.value) return;
+
+  const messageId = generateMessageId();
+  const now = Date.now();
+  const message = {
+    id: messageId,
+    text: inputText.value.trim(),
+    sent: true,
+    timestamp: now,
+    viewed: false,
+    destroying: false,
+    destroyed: false
+  };
+
+  const success = sendMessage({
+    type: 'text',
+    id: messageId,
+    text: message.text,
+    timestamp: message.timestamp,
+    status: 'pending'
+  });
+
+  if (success) {
+    messages.value.push(message);
+    inputText.value = '';
+    scrollToBottom();
+  }
+}
+
+function copyRoomId() {
+  navigator.clipboard.writeText(currentRoomId.value).then(() => {
+    copied.value = true;
+    setTimeout(() => {
+      copied.value = false;
+    }, 2000);
+  });
+}
+
+function handleWebRtcConnected() {
+  const sentMessages = messages.value.filter((m) => m.sent);
+  if (sentMessages.length > 0) {
+    setTimeout(() => {
+      syncMessagesToPeer();
+    }, 500);
+  } else {
+    sendMessage({
+      type: 'sync-request'
+    });
+  }
 }
 
 async function handleCreateRoom() {
@@ -228,6 +502,9 @@ async function handleJoinRoom() {
 }
 
 function setupRoomListeners() {
+  startGlobalCheck();
+  setupVisibilityListener();
+
   socket.on('peer-joined', ({ peerId }) => {
     peerJoined.value = true;
     const isInitiator = !socket.id || socket.id < peerId;
@@ -246,113 +523,29 @@ function setupRoomListeners() {
   });
 
   removeMessageListener = onMessage(handleIncomingMessage);
-  removeConnectionListener = onConnectionChange(() => {});
-}
 
-function handleIncomingMessage(data) {
-  if (data.type === 'text') {
-    messages.value.push({
-      id: data.id,
-      text: data.text,
-      sent: false,
-      timestamp: data.timestamp,
-      viewed: false,
-      destroying: false,
-      destroyed: false,
-      countdown: 5
-    });
-    scrollToBottom();
-  } else if (data.type === 'viewed') {
-    const msg = messages.value.find((m) => m.id === data.messageId);
-    if (msg) {
-      msg.viewed = true;
+  let wasConnected = false;
+  removeConnectionListener = onConnectionChange((connected) => {
+    if (connected && !wasConnected) {
+      wasConnected = true;
+      handleWebRtcConnected();
+    } else if (!connected) {
+      wasConnected = false;
     }
-  }
-}
-
-function viewMessage(msg) {
-  if (msg.viewed) return;
-  msg.viewed = true;
-  msg.countdown = 5;
-
-  sendMessage({
-    type: 'viewed',
-    messageId: msg.id
-  });
-
-  startBurnCountdown(msg);
-}
-
-function startBurnCountdown(msg) {
-  if (countdownTimers.has(msg.id)) return;
-
-  const interval = setInterval(() => {
-    msg.countdown--;
-    if (msg.countdown <= 0) {
-      clearInterval(interval);
-      countdownTimers.delete(msg.id);
-      destroyMessage(msg, true);
+    if (connected) {
+      scrollToBottom();
     }
-  }, 1000);
-
-  countdownTimers.set(msg.id, interval);
-}
-
-function destroyMessage(msg, notifyPeer) {
-  msg.destroying = true;
-
-  setTimeout(() => {
-    msg.destroyed = true;
-    msg.text = '';
-    if (notifyPeer && !msg.sent) {
-      notifyMessageDestroyed(msg.id);
-    }
-  }, 500);
-}
-
-function handleSend() {
-  if (!inputText.value.trim() || !webrtcConnected.value) return;
-
-  const messageId = generateMessageId();
-  const message = {
-    id: messageId,
-    text: inputText.value.trim(),
-    sent: true,
-    timestamp: Date.now(),
-    viewed: false,
-    destroying: false,
-    destroyed: false,
-    countdown: 5
-  };
-
-  const success = sendMessage({
-    type: 'text',
-    id: messageId,
-    text: message.text,
-    timestamp: message.timestamp
-  });
-
-  if (success) {
-    messages.value.push(message);
-    inputText.value = '';
-    scrollToBottom();
-  }
-}
-
-function copyRoomId() {
-  navigator.clipboard.writeText(currentRoomId.value).then(() => {
-    copied.value = true;
-    setTimeout(() => {
-      copied.value = false;
-    }, 2000);
   });
 }
 
 function handleLeave() {
-  for (const [, timer] of countdownTimers) {
-    clearInterval(timer);
+  stopGlobalCheck();
+  removeVisibilityListener();
+
+  for (const [, timer] of destroyTimers) {
+    clearTimeout(timer);
   }
-  countdownTimers.clear();
+  destroyTimers.clear();
 
   if (removeMessageListener) removeMessageListener();
   if (removeConnectionListener) removeConnectionListener();
@@ -382,12 +575,17 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  for (const [, timer] of countdownTimers) {
-    clearInterval(timer);
+  stopGlobalCheck();
+  removeVisibilityListener();
+
+  for (const [, timer] of destroyTimers) {
+    clearTimeout(timer);
   }
-  countdownTimers.clear();
+  destroyTimers.clear();
+
   if (removeMessageListener) removeMessageListener();
   if (removeConnectionListener) removeConnectionListener();
+
   cleanupWebRTC();
 });
 </script>
