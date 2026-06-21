@@ -70,47 +70,74 @@
           <button class="leave-btn" @click="handleLeave">离开</button>
         </div>
 
-        <div class="messages-container" ref="messagesContainer">
-          <div v-if="messages.length === 0" class="empty-state">
-            <div class="empty-icon">🔒</div>
-            <p>暂无消息</p>
-            <p class="empty-hint">消息将端到端加密传输，阅后5秒自动销毁</p>
+        <div class="chat-main">
+          <div class="messages-container" ref="messagesContainer">
+            <div v-if="messages.length === 0 && logs.length === 0" class="empty-state">
+              <div class="empty-icon">🔒</div>
+              <p>暂无消息</p>
+              <p class="empty-hint">消息将端到端加密传输，阅后5秒自动销毁</p>
+            </div>
+
+            <div
+              v-for="msg in messages"
+              :key="msg.id"
+              class="message-item"
+              :class="{
+                'message-sent': msg.sent,
+                'message-received': !msg.sent,
+                'message-destroying': msg.destroying,
+                'message-destroyed': msg.destroyed,
+                'message-recalled': msg.recalled
+              }"
+            >
+              <div v-if="msg.destroyed || msg.recalled" class="destroyed-content">
+                <span class="destroyed-icon">{{ msg.recalled ? '↩️' : '💨' }}</span>
+                <span>{{ msg.recalled ? '消息已撤回' : '消息已销毁' }}</span>
+              </div>
+
+              <div v-else-if="!msg.sent && !msg.viewed" class="blurred-content">
+                <div class="blurred-text">******</div>
+                <button class="view-btn" @click="viewMessage(msg)">
+                  点击查看
+                </button>
+                <p class="burn-hint">查看后5秒自动销毁</p>
+              </div>
+
+              <div v-else class="message-content">
+                <div class="message-text">{{ msg.text }}</div>
+                <div class="message-meta">
+                  <span>{{ formatDateTime(msg.timestamp) }}</span>
+                  <span v-if="msg.sent && !msg.viewed && !msg.recalled" class="message-actions">
+                    <button class="recall-btn" @click="recallMessage(msg)">撤回</button>
+                    <span>已送达 · 待查看</span>
+                  </span>
+                  <span v-else-if="msg.sent && msg.viewed && !msg.destroyed" class="burn-countdown">
+                    已查看 · {{ getCountdown(msg) }}s 后销毁
+                  </span>
+                  <span v-else-if="!msg.destroyed" class="burn-countdown">
+                    {{ getCountdown(msg) }}s 后销毁
+                  </span>
+                </div>
+              </div>
+            </div>
           </div>
 
-          <div
-            v-for="msg in messages"
-            :key="msg.id"
-            class="message-item"
-            :class="{
-              'message-sent': msg.sent,
-              'message-received': !msg.sent,
-              'message-destroying': msg.destroying,
-              'message-destroyed': msg.destroyed
-            }"
-          >
-            <div v-if="msg.destroyed" class="destroyed-content">
-              <span class="destroyed-icon">💨</span>
-              <span>消息已销毁</span>
+          <div class="activity-log">
+            <div class="log-header">
+              <span class="log-title">📋 操作日志</span>
             </div>
-
-            <div v-else-if="!msg.sent && !msg.viewed" class="blurred-content">
-              <div class="blurred-text">******</div>
-              <button class="view-btn" @click="viewMessage(msg)">
-                点击查看
-              </button>
-              <p class="burn-hint">查看后5秒自动销毁</p>
-            </div>
-
-            <div v-else class="message-content">
-              <div class="message-text">{{ msg.text }}</div>
-              <div class="message-meta">
-                <span>{{ formatTime(msg.timestamp) }}</span>
-                <span v-if="msg.sent && !msg.destroyed && !msg.viewed">已送达 · 待查看</span>
-                <span v-else-if="msg.sent && msg.viewed && !msg.destroyed">已查看 · {{ getCountdown(msg) }}s 后销毁</span>
-                <span v-else-if="!msg.destroyed" class="burn-countdown">
-                  {{ getCountdown(msg) }}s 后销毁
-                </span>
+            <div class="log-list" ref="logListRef">
+              <div
+                v-for="log in logs"
+                :key="log.id"
+                class="log-item"
+                :class="'log-' + log.action"
+              >
+                <span class="log-icon">{{ getLogIcon(log.action) }}</span>
+                <span class="log-text">{{ getLogText(log) }}</span>
+                <span class="log-time">{{ formatTime(log.timestamp) }}</span>
               </div>
+              <div v-if="logs.length === 0" class="log-empty">暂无操作记录</div>
             </div>
           </div>
         </div>
@@ -152,6 +179,8 @@ import { useSocket, createRoom, joinRoom, notifyMessageDestroyed } from './compo
 import { useWebRTC } from './composables/useWebRTC';
 
 const BURN_DELAY = 5000;
+const SENDER_NAME = '我';
+const PEER_NAME = '对方';
 
 const socket = useSocket();
 const { isConnected: webrtcConnected, setPeerId, sendMessage, onMessage, onConnectionChange, cleanup: cleanupWebRTC } = useWebRTC();
@@ -166,15 +195,18 @@ const peerJoined = ref(false);
 const copied = ref(false);
 
 const messages = ref([]);
+const logs = ref([]);
 const inputText = ref('');
 const messagesContainer = ref(null);
+const logListRef = ref(null);
 
 let removeMessageListener = null;
 let removeConnectionListener = null;
 const destroyTimers = new Map();
 let globalCheckTimer = null;
+let isSender = false;
 
-function generateMessageId() {
+function generateId() {
   return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 }
 
@@ -183,10 +215,70 @@ function formatTime(timestamp) {
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function formatDateTime(timestamp) {
+  const date = new Date(timestamp);
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+}
+
 function getCountdown(msg) {
-  if (!msg.viewed || msg.destroyed) return 0;
+  if (!msg.viewed || msg.destroyed || msg.recalled) return 0;
   const remaining = Math.max(0, Math.ceil((msg.destroyAt - Date.now()) / 1000));
   return remaining;
+}
+
+function getLogIcon(action) {
+  const icons = {
+    send: '📤',
+    receive: '📥',
+    view: '👁️',
+    recall: '↩️',
+    destroy: '💨'
+  };
+  return icons[action] || '📝';
+}
+
+function getLogText(log) {
+  const who = log.byMe ? SENDER_NAME : PEER_NAME;
+  const shortId = log.messageId ? log.messageId.substring(0, 6).toUpperCase() : '';
+  const suffix = shortId ? ` [${shortId}]` : '';
+
+  switch (log.action) {
+    case 'send':
+      return `${who} 发送了一条消息${suffix}`;
+    case 'receive':
+      return `${who} 收到一条消息${suffix}`;
+    case 'view':
+      return `${who} 查看了消息${suffix}`;
+    case 'recall':
+      return `${who} 撤回了消息${suffix}`;
+    case 'destroy':
+      return `消息${suffix} 已销毁`;
+    default:
+      return '';
+  }
+}
+
+function addLog(action, byMe, messageId, extra = {}) {
+  const log = {
+    id: generateId(),
+    action,
+    byMe,
+    messageId,
+    timestamp: Date.now(),
+    ...extra
+  };
+  logs.value.push(log);
+  nextTick(() => {
+    if (logListRef.value) {
+      logListRef.value.scrollTop = logListRef.value.scrollHeight;
+    }
+  });
 }
 
 function scrollToBottom() {
@@ -197,12 +289,26 @@ function scrollToBottom() {
   });
 }
 
+function broadcastLog(action, byMe, messageId, extra = {}) {
+  addLog(action, byMe, messageId, extra);
+  sendMessage({
+    type: 'log',
+    log: {
+      action,
+      byMe: !byMe,
+      messageId,
+      timestamp: Date.now(),
+      ...extra
+    }
+  });
+}
+
 function startGlobalCheck() {
   if (globalCheckTimer) return;
   globalCheckTimer = setInterval(() => {
     const now = Date.now();
     for (const msg of messages.value) {
-      if (msg.viewed && !msg.destroyed && msg.destroyAt && now >= msg.destroyAt) {
+      if (msg.viewed && !msg.destroyed && !msg.recalled && msg.destroyAt && now >= msg.destroyAt) {
         destroyMessage(msg, !msg.sent);
       }
     }
@@ -228,7 +334,7 @@ function handleVisibilityChange() {
   if (!document.hidden) {
     const now = Date.now();
     for (const msg of messages.value) {
-      if (msg.viewed && !msg.destroyed && msg.destroyAt) {
+      if (msg.viewed && !msg.destroyed && !msg.recalled && msg.destroyAt) {
         if (now >= msg.destroyAt) {
           destroyMessage(msg, !msg.sent);
         } else {
@@ -265,7 +371,7 @@ function markMessageViewed(msg, viewedAt) {
 }
 
 function destroyMessage(msg, notifyPeer) {
-  if (msg.destroyed) return;
+  if (msg.destroyed || msg.destroying || msg.recalled) return;
 
   if (destroyTimers.has(msg.id)) {
     clearTimeout(destroyTimers.get(msg.id));
@@ -273,6 +379,9 @@ function destroyMessage(msg, notifyPeer) {
   }
 
   msg.destroying = true;
+  if (notifyPeer) {
+    addLog('destroy', msg.sent === isSender, msg.id);
+  }
 
   setTimeout(() => {
     msg.destroyed = true;
@@ -281,15 +390,31 @@ function destroyMessage(msg, notifyPeer) {
   }, 500);
 
   if (notifyPeer) {
-    if (msg.sent) {
-      sendMessage({
-        type: 'destroyed',
-        messageId: msg.id
-      });
-    } else {
-      notifyMessageDestroyed(msg.id);
-    }
+    sendMessage({
+      type: 'destroyed',
+      messageId: msg.id
+    });
   }
+}
+
+function recallMessage(msg) {
+  if (!msg.sent || msg.viewed || msg.destroyed || msg.recalled) return;
+
+  msg.recalled = true;
+  msg.text = '';
+  msg.recalledAt = Date.now();
+
+  if (destroyTimers.has(msg.id)) {
+    clearTimeout(destroyTimers.get(msg.id));
+    destroyTimers.delete(msg.id);
+  }
+
+  broadcastLog('recall', true, msg.id);
+
+  sendMessage({
+    type: 'recalled',
+    messageId: msg.id
+  });
 }
 
 function syncMessageStatus(messageId, status, extra = {}) {
@@ -303,9 +428,11 @@ function syncMessageStatus(messageId, status, extra = {}) {
       timestamp: extra.timestamp,
       viewed: false,
       destroying: false,
-      destroyed: false
+      destroyed: false,
+      recalled: false
     };
     messages.value.push(msg);
+    addLog('receive', false, messageId);
     scrollToBottom();
   }
 
@@ -313,8 +440,12 @@ function syncMessageStatus(messageId, status, extra = {}) {
 
   if (status === 'viewed' && !msg.viewed) {
     markMessageViewed(msg, extra.viewedAt);
-  } else if (status === 'destroyed' && !msg.destroyed) {
+  } else if (status === 'destroyed' && !msg.destroyed && !msg.recalled) {
     destroyMessage(msg, false);
+  } else if (status === 'recalled' && !msg.recalled && !msg.destroyed) {
+    msg.recalled = true;
+    msg.text = '';
+    msg.recalledAt = extra.recalledAt || Date.now();
   }
 }
 
@@ -328,6 +459,11 @@ function handleIncomingMessage(data) {
       if (data.status === 'destroyed') {
         destroyMessage(existing, false);
       }
+      if (data.status === 'recalled') {
+        existing.recalled = true;
+        existing.text = '';
+        existing.recalledAt = data.recalledAt || Date.now();
+      }
       return;
     }
 
@@ -338,7 +474,8 @@ function handleIncomingMessage(data) {
       timestamp: data.timestamp,
       viewed: false,
       destroying: false,
-      destroyed: false
+      destroyed: false,
+      recalled: false
     };
 
     if (data.status === 'viewed') {
@@ -348,13 +485,19 @@ function handleIncomingMessage(data) {
       msg.destroyed = true;
       msg.text = '';
     }
+    if (data.status === 'recalled') {
+      msg.recalled = true;
+      msg.text = '';
+      msg.recalledAt = data.recalledAt || Date.now();
+    }
 
     messages.value.push(msg);
+    addLog('receive', false, data.id);
     scrollToBottom();
 
   } else if (data.type === 'viewed') {
     const msg = messages.value.find((m) => m.id === data.messageId);
-    if (msg) {
+    if (msg && !msg.viewed) {
       markMessageViewed(msg, data.viewedAt);
     }
 
@@ -364,6 +507,25 @@ function handleIncomingMessage(data) {
       destroyMessage(msg, false);
     }
 
+  } else if (data.type === 'recalled') {
+    const msg = messages.value.find((m) => m.id === data.messageId);
+    if (msg && !msg.recalled && !msg.destroyed) {
+      msg.recalled = true;
+      msg.text = '';
+      msg.recalledAt = Date.now();
+    }
+
+  } else if (data.type === 'log') {
+    logs.value.push({
+      id: generateId(),
+      ...data.log
+    });
+    nextTick(() => {
+      if (logListRef.value) {
+        logListRef.value.scrollTop = logListRef.value.scrollHeight;
+      }
+    });
+
   } else if (data.type === 'sync-request') {
     syncMessagesToPeer();
 
@@ -372,7 +534,8 @@ function handleIncomingMessage(data) {
       syncMessageStatus(item.id, item.status, {
         text: item.text,
         timestamp: item.timestamp,
-        viewedAt: item.viewedAt
+        viewedAt: item.viewedAt,
+        recalledAt: item.recalledAt
       });
     }
   }
@@ -380,7 +543,7 @@ function handleIncomingMessage(data) {
 
 function syncMessagesToPeer() {
   const syncData = messages.value
-    .filter((m) => m.sent && !m.destroyed)
+    .filter((m) => m.sent && !m.destroyed && !m.recalled)
     .map((m) => ({
       id: m.id,
       text: m.text,
@@ -398,10 +561,12 @@ function syncMessagesToPeer() {
 }
 
 function viewMessage(msg) {
-  if (msg.viewed) return;
+  if (msg.viewed || msg.destroyed || msg.recalled) return;
 
   const viewedAt = Date.now();
   markMessageViewed(msg, viewedAt);
+
+  broadcastLog('view', true, msg.id);
 
   sendMessage({
     type: 'viewed',
@@ -413,7 +578,7 @@ function viewMessage(msg) {
 function handleSend() {
   if (!inputText.value.trim() || !webrtcConnected.value) return;
 
-  const messageId = generateMessageId();
+  const messageId = generateId();
   const now = Date.now();
   const message = {
     id: messageId,
@@ -422,7 +587,8 @@ function handleSend() {
     timestamp: now,
     viewed: false,
     destroying: false,
-    destroyed: false
+    destroyed: false,
+    recalled: false
   };
 
   const success = sendMessage({
@@ -435,6 +601,7 @@ function handleSend() {
 
   if (success) {
     messages.value.push(message);
+    addLog('send', true, messageId);
     inputText.value = '';
     scrollToBottom();
   }
@@ -470,6 +637,7 @@ async function handleCreateRoom() {
     if (response.success) {
       currentRoomId.value = response.roomId;
       inRoom.value = true;
+      isSender = true;
       setupRoomListeners();
     } else {
       error.value = response.error || '创建失败';
@@ -490,6 +658,7 @@ async function handleJoinRoom() {
     if (response.success) {
       currentRoomId.value = response.roomId;
       inRoom.value = true;
+      isSender = false;
       setupRoomListeners();
     } else {
       error.value = response.error || '加入失败';
@@ -559,6 +728,7 @@ function handleLeave() {
   joinRoomId.value = '';
   peerJoined.value = false;
   messages.value = [];
+  logs.value = [];
   inputText.value = '';
   error.value = '';
 }
